@@ -619,7 +619,11 @@ func (s *RoundRobinSelector) Pick(ctx context.Context, provider, model string, o
 		return nil, err
 	}
 	available = preferCodexWebsocketAuths(ctx, provider, available)
-	key := provider + ":" + canonicalModelKey(model)
+	return s.next(provider+":"+canonicalModelKey(model), available), nil
+}
+
+// next advances the rotation stored under key over ID-sorted, non-empty candidates.
+func (s *RoundRobinSelector) next(key string, available []*Auth) *Auth {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.lastPicked == nil {
@@ -633,7 +637,7 @@ func (s *RoundRobinSelector) Pick(ctx context.Context, provider, model string, o
 	s.ensureRotationKey(key, limit)
 	picked := available[successorIndex(available, s.lastPicked[key])]
 	s.lastPicked[key] = picked.ID
-	return picked, nil
+	return picked
 }
 
 // successorIndex returns the index of the first candidate ordered after lastID, wrapping to
