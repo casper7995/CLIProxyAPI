@@ -231,6 +231,15 @@ type Manager struct {
 	// Auto refresh state
 	refreshCancel context.CancelFunc
 	refreshLoop   *authAutoRefreshLoop
+	// reprobeCancel stops the quota cooldown re-probe loop.
+	reprobeCancel context.CancelFunc
+
+	// Quota signal persistence state, guarded by quotaSignalMu.
+	quotaSignalMu     sync.Mutex
+	quotaSignalStore  QuotaSignalStore
+	quotaSignalSaved  map[string]QuotaSignalSnapshot
+	quotaSignalCancel context.CancelFunc
+	quotaSignalDone   chan struct{}
 	// refreshJobs retains queued and running jobs across loop restarts under m.mu.
 	refreshJobs map[string]*authRefreshJob
 

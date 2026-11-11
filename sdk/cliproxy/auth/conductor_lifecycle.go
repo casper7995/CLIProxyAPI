@@ -500,6 +500,12 @@ func (m *Manager) updateInternalLocked(ctx context.Context, base, auth *Auth, mo
 			}
 		}
 	}
+	// The passive quota observation describes the credential, not this update:
+	// re-synthesized config credentials arrive without one, and dropping it left
+	// soonest-reset ranking healthy credentials as unobserved. Keep the newest.
+	observation := mergeQuotaObservation(auth.Quota, existing.Quota)
+	auth.Quota.ObservedAt = observation.ObservedAt
+	auth.Quota.Signals = observation.Signals
 	auth.UpdatedAt = now
 	cooldownStateChanged = normalizeModelStates(auth) || cooldownStateChanged
 	if m.cooldownDisabledForAuth(auth) || auth.Disabled || auth.Status == StatusDisabled {

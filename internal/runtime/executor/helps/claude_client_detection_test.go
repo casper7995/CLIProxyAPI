@@ -97,8 +97,10 @@ func TestDetectClaudeCodeRequestAcceptsConfiguredMeasuredBaseline(t *testing.T) 
 	headers := confirmedClaudeCodeHeaders()
 	headers.Set("User-Agent", "claude-cli/2.2.0 (external, cli)")
 	payload := claudeCodeDetectionPayload(validClaudeCodeMetadataUserID)
-	if detection := DetectClaudeCodeRequest(headers, payload, false); detection.Confirmed {
-		t.Fatalf("default detection = %#v, want unconfigured 2.2.0 rejected", detection)
+	// 2.2.0 is a newer release on the baseline's major line, so it is genuine
+	// Claude Code under the default floor as well as under a configured baseline.
+	if detection := DetectClaudeCodeRequest(headers, payload, false); !detection.Confirmed {
+		t.Fatalf("default detection = %#v, want newer 2.2.0 confirmed", detection)
 	}
 
 	cfg := &config.Config{ClaudeHeaderDefaults: config.ClaudeHeaderDefaults{
@@ -151,6 +153,7 @@ func TestDetectClaudeCodeRequestClassifiesEntrypoints(t *testing.T) {
 		{name: "remote", userAgent: "claude-cli/2.1.280 (external, remote)", entrypoint: "remote", subclient: "claude-remote"},
 		{name: "github-action", userAgent: "claude-cli/2.1.280 (external, claude-code-github-action)", entrypoint: "claude-code-github-action", subclient: "claude-code-gh-action"},
 		{name: "unknown", userAgent: "claude-cli/2.1.280 (external, copied-client)", entrypoint: "copied-client"},
+		{name: "agent-sdk host", userAgent: "claude-cli/2.1.280 (external, t3-code, agent-sdk/0.3.321)", entrypoint: "t3-code", agentSDKVersion: "0.3.321", native: true},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			headers := confirmedClaudeCodeHeaders()
@@ -410,7 +413,7 @@ func TestDetectClaudeCodeRequestRejectsMalformedNativeSignals(t *testing.T) {
 		{name: "invalid session", headers: confirmedClaudeCodeHeaders(), userID: `{"device_id":"0000000000000000000000000000000000000000000000000000000000000000","account_uuid":"","session_id":"session"}`},
 		{name: "malformed user agent", headers: http.Header{"User-Agent": {"claude-cli/not-a-version (external, cli)"}, "X-App": {"cli"}, "Anthropic-Beta": {"claude-code-20250219"}}, userID: validClaudeCodeMetadataUserID},
 		{name: "older patch user agent", headers: http.Header{"User-Agent": {"claude-cli/2.1.257 (external, cli)"}, "X-App": {"cli"}, "Anthropic-Beta": {"claude-code-20250219"}}, userID: validClaudeCodeMetadataUserID},
-		{name: "unmeasured next-minor user agent", headers: http.Header{"User-Agent": {"claude-cli/2.2.0 (external, cli)"}, "X-App": {"cli"}, "Anthropic-Beta": {"claude-code-20250219"}}, userID: validClaudeCodeMetadataUserID},
+		{name: "next-major user agent", headers: http.Header{"User-Agent": {"claude-cli/3.0.0 (external, cli)"}, "X-App": {"cli"}, "Anthropic-Beta": {"claude-code-20250219"}}, userID: validClaudeCodeMetadataUserID},
 		{name: "implausible future user agent", headers: http.Header{"User-Agent": {"claude-cli/999.0.0 (external, cli)"}, "X-App": {"cli"}, "Anthropic-Beta": {"claude-code-20250219"}}, userID: validClaudeCodeMetadataUserID},
 		{name: "unrelated beta", headers: http.Header{"User-Agent": {"claude-cli/2.1.280 (external, cli)"}, "X-App": {"cli"}, "Anthropic-Beta": {"anything"}}, userID: validClaudeCodeMetadataUserID},
 	}

@@ -19,11 +19,15 @@ import (
 // exhausted credentials are left to the manager's cooldown handling, which removes them before Pick.
 //
 // Candidates are ordered as follows, and the first is picked:
-//  1. Credentials without a usable 7d reset (never observed, unparseable, or already past because the
-//     window rolled over), rotated round-robin so each one is probed and reports fresh signals.
-//  2. Credentials by soonest 7d reset.
-//  3. Credentials whose last response reported a 5h or 7d rejection that has not reset yet, by when
-//     the rejection lifts.
+//  1. Credentials with headroom, by soonest 7d reset.
+//  2. Credentials without a usable 7d reset (never observed, unparseable, or already past because the
+//     window rolled over), rotated round-robin. They are used only when no observed credential has
+//     headroom: an unobserved credential may well be exhausted, and one whose first response is
+//     still streaming stays unobserved, so preferring them sent bursts of new sessions to unknown and
+//     exhausted accounts after a restart. The cooldown re-probe loop observes them out of band.
+//  3. Credentials whose last response reported an exhausted 5h or 7d window (status rejected, or
+//     utilization at or above claudeNearLimitUtilization) that has not reset yet, by when the
+//     window lifts. A nearly spent window must not win just because its reset is soonest.
 //
 // Ties go to the lower 5h utilization, then the lower auth ID. A pool that is not entirely Claude
 // rotates round-robin.
@@ -37,13 +41,20 @@ const (
 	claudeUnified5hUtilizationSignal = "Anthropic-Ratelimit-Unified-5h-Utilization"
 	claudeUnified7dResetSignal       = "Anthropic-Ratelimit-Unified-7d-Reset"
 	claudeUnified7dStatusSignal      = "Anthropic-Ratelimit-Unified-7d-Status"
+	claudeUnified7dUtilizationSignal = "Anthropic-Ratelimit-Unified-7d-Utilization"
+
+	// claudeNearLimitUtilization is the utilization from which soonest-reset treats a window as spent:
+	// the next few requests would exhaust it, so it ranks with rejected credentials.
+	claudeNearLimitUtilization = 0.98
+	// claudeExhaustedUtilization is the utilization at which a window is fully used.
+	claudeExhaustedUtilization = 1.0
 )
 
 type soonestResetTier int
 
 const (
-	soonestResetUnknown soonestResetTier = iota
-	soonestResetKnown
+	soonestResetKnown soonestResetTier = iota
+	soonestResetUnknown
 	soonestResetRejected
 )
 
@@ -66,19 +77,20 @@ func (s *SoonestResetSelector) Pick(ctx context.Context, provider, model string,
 	key := provider + ":" + canonicalModelKey(model)
 	if !slices.ContainsFunc(available, func(auth *Auth) bool { return !isClaudeAuth(auth) }) {
 		ranks := make([]soonestResetRank, 0, len(available))
-		var unknown []*Auth
 		for _, auth := range available {
-			rank := rankBySoonestReset(auth, now)
+			ranks = append(ranks, rankBySoonestReset(auth, now))
+		}
+		best := slices.MinFunc(ranks, compareSoonestResetRank)
+		if best.tier != soonestResetUnknown {
+			return best.auth, nil
+		}
+		// Unobserved credentials share a tier; rotate so none is favored.
+		available = available[:0:0]
+		for _, rank := range ranks {
 			if rank.tier == soonestResetUnknown {
-				unknown = append(unknown, auth)
-				continue
+				available = append(available, rank.auth)
 			}
-			ranks = append(ranks, rank)
 		}
-		if len(unknown) == 0 {
-			return slices.MinFunc(ranks, compareSoonestResetRank).auth, nil
-		}
-		available = unknown
 	}
 	return s.rotation.next(key, available), nil
 }
@@ -89,23 +101,13 @@ func isClaudeAuth(auth *Auth) bool {
 
 func rankBySoonestReset(auth *Auth, now time.Time) soonestResetRank {
 	signals := auth.Quota.Signals
-	rank := soonestResetRank{auth: auth, util5h: math.Inf(1)}
+	rank := soonestResetRank{auth: auth, tier: soonestResetUnknown, util5h: math.Inf(1)}
 	if util, errParse := strconv.ParseFloat(strings.TrimSpace(signals[claudeUnified5hUtilizationSignal]), 64); errParse == nil && !math.IsNaN(util) {
 		rank.util5h = util
 	}
-	for _, window := range [][2]string{
-		{claudeUnified5hStatusSignal, claudeUnified5hResetSignal},
-		{claudeUnified7dStatusSignal, claudeUnified7dResetSignal},
-	} {
-		if !strings.EqualFold(strings.TrimSpace(signals[window[0]]), "rejected") {
-			continue
-		}
-		if reset, ok := parseQuotaSignalTime(signals[window[1]]); ok && reset.After(now) && reset.After(rank.at) {
-			rank.tier = soonestResetRejected
-			rank.at = reset
-		}
-	}
-	if rank.tier == soonestResetRejected {
+	if until, ok := claudeExhaustedUntil(signals, now, claudeNearLimitUtilization); ok {
+		rank.tier = soonestResetRejected
+		rank.at = until
 		return rank
 	}
 	if reset, ok := parseQuotaSignalTime(signals[claudeUnified7dResetSignal]); ok && reset.After(now) {
@@ -113,6 +115,30 @@ func rankBySoonestReset(auth *Auth, now time.Time) soonestResetRank {
 		rank.at = reset
 	}
 	return rank
+}
+
+// claudeExhaustedUntil returns the latest future reset among the shared 5h and 7d windows that
+// are exhausted: status rejected, or utilization at or above minUtilization. A window whose reset
+// is missing or already past is ignored, because its last reading no longer applies.
+func claudeExhaustedUntil(signals map[string]string, now time.Time, minUtilization float64) (time.Time, bool) {
+	var until time.Time
+	for _, window := range [][3]string{
+		{claudeUnified5hStatusSignal, claudeUnified5hUtilizationSignal, claudeUnified5hResetSignal},
+		{claudeUnified7dStatusSignal, claudeUnified7dUtilizationSignal, claudeUnified7dResetSignal},
+	} {
+		exhausted := strings.EqualFold(strings.TrimSpace(signals[window[0]]), "rejected")
+		if !exhausted {
+			util, errParse := strconv.ParseFloat(strings.TrimSpace(signals[window[1]]), 64)
+			exhausted = errParse == nil && !math.IsNaN(util) && util >= minUtilization
+		}
+		if !exhausted {
+			continue
+		}
+		if reset, ok := parseQuotaSignalTime(signals[window[2]]); ok && reset.After(now) && reset.After(until) {
+			until = reset
+		}
+	}
+	return until, !until.IsZero()
 }
 
 func compareSoonestResetRank(a, b soonestResetRank) int {
