@@ -127,15 +127,14 @@ func TestResolveClaudeDeviceProfileLocalUsesBaselineForInvalidSignals(t *testing
 	}
 }
 
-func TestResolveClaudeDeviceProfileLocalKeepsExactMeasuredSoftwareBaseline(t *testing.T) {
+func TestResolveClaudeDeviceProfileLocalPassesNewerPatchClient(t *testing.T) {
 	ResetClaudeDeviceProfileCache()
 	auth := &cliproxyauth.Auth{ID: "auth-newer-patch-signals"}
 	headers := claudeDeviceHeaders("claude-cli/2.1.281 (external, cli)")
 
 	profile := resolveClaudeDeviceProfileLocal(auth, "api-key", headers, nil)
-	baseline := defaultClaudeDeviceProfile(nil)
-	if profile.UserAgent != baseline.UserAgent || profile.PackageVersion != baseline.PackageVersion || profile.RuntimeVersion != baseline.RuntimeVersion {
-		t.Fatalf("unmeasured profile = %#v, want exact local baseline %#v", profile, baseline)
+	if profile.UserAgent != "claude-cli/2.1.281 (external, cli)" {
+		t.Fatalf("newer patch profile = %#v, want the client's own 2.1.281", profile)
 	}
 }
 
@@ -325,14 +324,13 @@ func TestResolveClaudeDeviceProfileRequiredHomeNormalizesUnmeasuredCachedProfile
 	if errProfile != nil {
 		t.Fatalf("ResolveClaudeDeviceProfileRequired() error = %v", errProfile)
 	}
-	if profile.UserAgent != defaultClaudeFingerprintUserAgent {
-		t.Fatalf("UserAgent = %q, want local baseline %q", profile.UserAgent, defaultClaudeFingerprintUserAgent)
+	// The cached 2.4.0 entry carries a package and runtime below the floor, so it
+	// normalizes to the baseline; the genuine 2.3.0 client then upgrades it.
+	if profile.UserAgent != "claude-cli/2.3.0 (external, cli)" {
+		t.Fatalf("UserAgent = %q, want the newer client 2.3.0 over the normalized cache", profile.UserAgent)
 	}
-	if client.setCount != 0 {
-		t.Fatalf("KVSet count = %d, want no downgrade write", client.setCount)
-	}
-	if client.expireCount != 1 {
-		t.Fatalf("KVExpire count = %d, want cached refresh", client.expireCount)
+	if client.setCount != 1 {
+		t.Fatalf("KVSet count = %d, want one upgrade write", client.setCount)
 	}
 }
 

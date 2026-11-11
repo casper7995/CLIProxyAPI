@@ -212,13 +212,14 @@ func shouldUpgradeClaudeDeviceProfile(candidate, current ClaudeDeviceProfile) bo
 	return candidate.version.Compare(current.version) > 0
 }
 
-// plausibleClaudeCLIVersion treats the baseline as a floor for patch releases.
-// Claude Code auto-updates in the background; allow newer patch versions in the
-// same major/minor line to preserve native passthrough and prompt caching.
+// plausibleClaudeCLIVersion treats the baseline as a floor. Claude Code
+// auto-updates in the background, so any release at or above the baseline keeps
+// native passthrough; rewriting a newer client down to the baseline makes Claude
+// Code report a version mismatch against the endpoint.
+// The major version must still match: a different major line has never been
+// measured and is more likely forged than a real auto-update.
 func plausibleClaudeCLIVersion(candidate, baseline claudeCLIVersion) bool {
-	return candidate.major == baseline.major &&
-		candidate.minor == baseline.minor &&
-		candidate.patch >= baseline.patch
+	return candidate.major == baseline.major && candidate.Compare(baseline) >= 0
 }
 
 func parseClaudeSemver(raw string) (claudeCLIVersion, bool) {
@@ -267,6 +268,9 @@ func plausibleClaudeRuntimeVersion(candidate, baseline string) bool {
 	return candVer.Compare(baseVer) >= 0
 }
 
+// meetsClaudeDeviceProfileBaseline reports whether a client software tuple is at
+// or above the baseline floor: CLI version, SDK package version and runtime
+// version each compared as semver. The baseline is a floor, not a pin.
 func meetsClaudeDeviceProfileBaseline(candidate, baseline ClaudeDeviceProfile) bool {
 	if candidate.UserAgent == "" || !candidate.hasVersion {
 		return false
@@ -274,9 +278,9 @@ func meetsClaudeDeviceProfileBaseline(candidate, baseline ClaudeDeviceProfile) b
 	if baseline.UserAgent == "" || !baseline.hasVersion {
 		return false
 	}
-	return candidate.version.Compare(baseline.version) == 0 &&
-		candidate.PackageVersion == baseline.PackageVersion &&
-		candidate.RuntimeVersion == baseline.RuntimeVersion
+	return plausibleClaudeCLIVersion(candidate.version, baseline.version) &&
+		plausibleClaudePackageVersion(candidate.PackageVersion, baseline.PackageVersion) &&
+		plausibleClaudeRuntimeVersion(candidate.RuntimeVersion, baseline.RuntimeVersion)
 }
 
 func pinClaudeDeviceProfilePlatform(profile, baseline ClaudeDeviceProfile) ClaudeDeviceProfile {
@@ -286,7 +290,7 @@ func pinClaudeDeviceProfilePlatform(profile, baseline ClaudeDeviceProfile) Claud
 }
 
 // normalizeClaudeDeviceProfile pins stabilized profiles to the configured platform
-// and replaces any software tuple that does not exactly match the measured baseline.
+// and replaces any software tuple below the baseline floor with the baseline.
 func normalizeClaudeDeviceProfile(profile, baseline ClaudeDeviceProfile) ClaudeDeviceProfile {
 	profile = pinClaudeDeviceProfilePlatform(profile, baseline)
 	if !meetsClaudeDeviceProfileBaseline(profile, baseline) {
@@ -648,48 +652,38 @@ func ApplyClaudeDefaultDeviceProfileHeaders(r *http.Request, cfg *config.Config)
 	ApplyClaudeDeviceProfileHeaders(r, defaultClaudeDeviceProfile(cfg))
 }
 
-func ApplyClaudeLegacyDeviceHeaders(r *http.Request, ginHeaders http.Header, cfg *config.Config, confirmedClaudeCode bool, keepNewerVersions ...bool) {
+func ApplyClaudeLegacyDeviceHeaders(r *http.Request, ginHeaders http.Header, cfg *config.Config, confirmedClaudeCode bool, _ ...bool) {
 	if r == nil {
 		return
 	}
-	allowNewer := len(keepNewerVersions) > 0 && keepNewerVersions[0]
 	profile := defaultClaudeDeviceProfile(cfg)
-	miscEnsure := func(name, fallback string, valid func(string) bool) {
-		if current := strings.TrimSpace(r.Header.Get(name)); current != "" && (valid == nil || valid(current)) {
+	ensurePlatform := func(name, fallback string) {
+		if current := strings.TrimSpace(r.Header.Get(name)); current != "" {
 			return
 		}
-		if incoming := strings.TrimSpace(ginHeaders.Get(name)); incoming != "" && (valid == nil || valid(incoming)) {
+		if incoming := strings.TrimSpace(ginHeaders.Get(name)); incoming != "" {
 			r.Header.Set(name, incoming)
 			return
 		}
 		r.Header.Set(name, fallback)
 	}
 
+	// Genuine Claude Code at or above the baseline floor keeps its own software
+	// tuple, so the upstream sees the version the client actually runs. The tuple
+	// moves as a whole: an older or incomplete one gets the full baseline instead.
 	if confirmedClaudeCode {
-		validRuntime := func(value string) bool {
-			if !allowNewer && cfg != nil && strings.TrimSpace(cfg.ClaudeHeaderDefaults.RuntimeVersion) != "" {
-				return value == profile.RuntimeVersion
-			}
-			return plausibleClaudeRuntimeVersion(value, profile.RuntimeVersion)
-		}
-		validPackage := func(value string) bool {
-			if !allowNewer && cfg != nil && strings.TrimSpace(cfg.ClaudeHeaderDefaults.PackageVersion) != "" {
-				return value == profile.PackageVersion
-			}
-			return plausibleClaudePackageVersion(value, profile.PackageVersion)
-		}
-		miscEnsure("X-Stainless-Runtime-Version", profile.RuntimeVersion, validRuntime)
-		miscEnsure("X-Stainless-Package-Version", profile.PackageVersion, validPackage)
-		miscEnsure("X-Stainless-Os", mapStainlessOS(), nil)
-		miscEnsure("X-Stainless-Arch", mapStainlessArch(), nil)
-		if clientUA := strings.TrimSpace(ginHeaders.Get("User-Agent")); plausibleClaudeCodeUserAgent(clientUA, cfg) {
-			r.Header.Set("User-Agent", clientUA)
+		if client, ok := extractClaudeDeviceProfile(ginHeaders, cfg); ok && meetsClaudeDeviceProfileBaseline(client, profile) {
+			ensurePlatform("X-Stainless-Os", mapStainlessOS())
+			ensurePlatform("X-Stainless-Arch", mapStainlessArch())
+			r.Header.Set("User-Agent", client.UserAgent)
+			r.Header.Set("X-Stainless-Package-Version", client.PackageVersion)
+			r.Header.Set("X-Stainless-Runtime-Version", client.RuntimeVersion)
 			return
 		}
 	}
 
-	// Unconfirmed clients must not leak a copied or third-party software profile
-	// into the upstream Claude Code SDK fingerprint.
+	// Unconfirmed clients, and Claude Code below the floor, must not leak a copied
+	// or third-party software profile into the upstream Claude Code SDK fingerprint.
 	r.Header.Set("X-Stainless-Runtime-Version", profile.RuntimeVersion)
 	r.Header.Set("X-Stainless-Package-Version", profile.PackageVersion)
 	r.Header.Set("X-Stainless-Os", profile.OS)
