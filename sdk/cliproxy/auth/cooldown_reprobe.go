@@ -28,6 +28,12 @@ import (
 // The re-probe loop periodically sends one minimal request to each credential
 // whose quota cooldown still has a long way to go. An allowed answer clears the
 // cooldown through ResetQuota; a renewed 429 keeps it with the fresh deadline.
+//
+// The same probe also observes Claude credentials that have no usable quota
+// signals yet (new, or never used since signals were lost). soonest-reset ranks
+// such credentials after every observed one with headroom, so without this they
+// would only be observed once user traffic had nowhere else to go. They are
+// probed right after startup and on every cycle.
 
 const (
 	// DefaultCooldownReprobeInterval is used when routing.cooldown-reprobe-interval is unset.
@@ -109,6 +115,8 @@ func (m *Manager) StopCooldownReprobe() {
 }
 
 func (m *Manager) runCooldownReprobeLoop(ctx context.Context) {
+	// Observe unknown credentials immediately; long cooldowns wait for the first cycle.
+	m.cooldownReprobeSweep(ctx, sleepContext, false)
 	for {
 		wait := cooldownReprobeDisabledPoll
 		if interval := CooldownReprobeInterval(m.runtimeConfigSnapshot()); interval > 0 {
@@ -119,7 +127,7 @@ func (m *Manager) runCooldownReprobeLoop(ctx context.Context) {
 		if !sleepContext(ctx, wait) {
 			return
 		}
-		m.cooldownReprobeTick(ctx, sleepContext)
+		m.cooldownReprobeSweep(ctx, sleepContext, true)
 	}
 }
 
@@ -141,6 +149,12 @@ func sleepContext(ctx context.Context, d time.Duration) bool {
 // probes were sent. It does nothing when re-probing is disabled. wait staggers
 // consecutive probes and aborts the sweep when it returns false.
 func (m *Manager) cooldownReprobeTick(ctx context.Context, wait func(context.Context, time.Duration) bool) int {
+	return m.cooldownReprobeSweep(ctx, wait, true)
+}
+
+// cooldownReprobeSweep probes unobserved credentials and, when includeCooled is
+// set, credentials under a long quota cooldown.
+func (m *Manager) cooldownReprobeSweep(ctx context.Context, wait func(context.Context, time.Duration) bool, includeCooled bool) int {
 	if m == nil || m.HomeEnabled() {
 		return 0
 	}
@@ -148,7 +162,7 @@ func (m *Manager) cooldownReprobeTick(ctx context.Context, wait func(context.Con
 	if interval <= 0 {
 		return 0
 	}
-	candidates := m.cooldownReprobeCandidates(time.Now())
+	candidates := m.cooldownReprobeCandidates(time.Now(), includeCooled)
 	stagger := min(cooldownReprobeMaxStagger, interval/20)
 	probed := 0
 	for i, candidate := range candidates {
@@ -170,11 +184,15 @@ type cooldownReprobeCandidate struct {
 	model       string
 	credential  bool
 	cooldownEnd time.Time
+	// observe marks a credential probed only to learn its quota signals.
+	observe bool
 }
 
-// cooldownReprobeCandidates lists enabled Claude credentials under a quota
-// cooldown with more than cooldownReprobeMinRemaining left, highest priority first.
-func (m *Manager) cooldownReprobeCandidates(now time.Time) []cooldownReprobeCandidate {
+// cooldownReprobeCandidates lists enabled Claude credentials to probe, highest
+// priority first: those without usable quota signals and not cooling, and (with
+// includeCooled) those under a quota cooldown with more than
+// cooldownReprobeMinRemaining left.
+func (m *Manager) cooldownReprobeCandidates(now time.Time, includeCooled bool) []cooldownReprobeCandidate {
 	m.mu.RLock()
 	snapshots := make([]*Auth, 0, len(m.auths))
 	for _, auth := range m.auths {
@@ -190,11 +208,15 @@ func (m *Manager) cooldownReprobeCandidates(now time.Time) []cooldownReprobeCand
 			hasUnauthorizedAuthFailure(auth) || m.cooldownDisabledForAuth(auth) {
 			continue
 		}
-		candidate, ok := cooldownReprobeTarget(auth, now)
-		if !ok {
+		if candidate, ok := cooldownReprobeTarget(auth, now); ok {
+			if includeCooled {
+				out = append(out, candidate)
+			}
 			continue
 		}
-		out = append(out, candidate)
+		if candidate, ok := observeProbeTarget(auth, now); ok {
+			out = append(out, candidate)
+		}
 	}
 	slices.SortFunc(out, func(a, b cooldownReprobeCandidate) int {
 		if pa, pb := authPriority(a.auth), authPriority(b.auth); pa != pb {
@@ -272,6 +294,28 @@ func cooldownReprobeTarget(auth *Auth, now time.Time) (cooldownReprobeCandidate,
 	return candidate, candidate.model != ""
 }
 
+// observeProbeTarget selects a credential that has no usable 7d reset in its
+// quota signals and is not cooling at all.
+func observeProbeTarget(auth *Auth, now time.Time) (cooldownReprobeCandidate, bool) {
+	if rankBySoonestReset(auth, now).tier != soonestResetUnknown || isAuthActiveCooldown(auth, now) {
+		return cooldownReprobeCandidate{}, false
+	}
+	model := cheapestClaudeModelForAuth(auth.ID)
+	if model == "" {
+		if models := modelsForRegisteredAuth(auth.ID); len(models) > 0 {
+			slices.Sort(models)
+			model = models[0]
+		}
+	}
+	if model == "" {
+		return cooldownReprobeCandidate{}, false
+	}
+	if blocked, _, _ := isAuthBlockedForModel(auth, model, now); blocked {
+		return cooldownReprobeCandidate{}, false
+	}
+	return cooldownReprobeCandidate{auth: auth, model: model, observe: true}, true
+}
+
 // cheapestClaudeModelForAuth prefers a registered Haiku model, which is the
 // cheapest Claude tier and the model Claude Code itself uses for quota checks.
 func cheapestClaudeModelForAuth(authID string) string {
@@ -346,7 +390,11 @@ func (m *Manager) reprobeCooldown(parent context.Context, candidate cooldownRepr
 		Headers:         make(http.Header),
 	}
 
-	log.Infof("cooldown reprobe: probing %s (model=%s, cooldown until %s)", name, upstreamModel, candidate.cooldownEnd.Format(time.RFC3339))
+	if candidate.observe {
+		log.Infof("cooldown reprobe: observing %s (model=%s, no quota signals yet)", name, upstreamModel)
+	} else {
+		log.Infof("cooldown reprobe: probing %s (model=%s, cooldown until %s)", name, upstreamModel, candidate.cooldownEnd.Format(time.RFC3339))
+	}
 	seq := m.nextExecutionSeq()
 	resp, errExec := executor.Execute(ctx, auth, req, opts)
 	if parent.Err() != nil {
@@ -366,6 +414,12 @@ func (m *Manager) reprobeCooldown(parent context.Context, candidate cooldownRepr
 		ExecutionSeq:      seq,
 	}
 
+	if errExec == nil && candidate.observe {
+		// Nothing to clear: recording the result stores the observed signals.
+		m.MarkResult(ctx, result)
+		log.Infof("cooldown reprobe: %s observed (7d utilization %s)", name, headers.Get("Anthropic-Ratelimit-Unified-7d-Utilization"))
+		return true
+	}
 	if errExec == nil {
 		if claudeUnifiedHeadersRejected(headers) {
 			log.Infof("cooldown reprobe: %s answered but rate-limit headers still report rejection; keeping cooldown", name)
@@ -392,7 +446,7 @@ func (m *Manager) reprobeCooldown(parent context.Context, candidate cooldownRepr
 	result.Error = resultErrorFromError(errExec)
 	result.RetryAfter = retryAfterFromError(errExec)
 	result.CredentialScope = isCredentialScopedError(errExec)
-	if result.RetryAfter != nil && *result.RetryAfter > 0 {
+	if result.RetryAfter != nil && *result.RetryAfter > 0 && !candidate.cooldownEnd.IsZero() {
 		newEnd := time.Now().Add(*result.RetryAfter)
 		if newEnd.Before(candidate.cooldownEnd.Add(-time.Minute)) {
 			// Cooldown writes are monotonic, so an earlier upstream reset can

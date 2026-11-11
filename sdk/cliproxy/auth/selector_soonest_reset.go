@@ -19,9 +19,12 @@ import (
 // exhausted credentials are left to the manager's cooldown handling, which removes them before Pick.
 //
 // Candidates are ordered as follows, and the first is picked:
-//  1. Credentials without a usable 7d reset (never observed, unparseable, or already past because the
-//     window rolled over), rotated round-robin so each one is probed and reports fresh signals.
-//  2. Credentials by soonest 7d reset.
+//  1. Credentials with headroom, by soonest 7d reset.
+//  2. Credentials without a usable 7d reset (never observed, unparseable, or already past because the
+//     window rolled over), rotated round-robin. They are used only when no observed credential has
+//     headroom: an unobserved credential may well be exhausted, and one whose first response is
+//     still streaming stays unobserved, so preferring them sent bursts of new sessions to unknown and
+//     exhausted accounts after a restart. The cooldown re-probe loop observes them out of band.
 //  3. Credentials whose last response reported an exhausted 5h or 7d window (status rejected, or
 //     utilization at or above claudeNearLimitUtilization) that has not reset yet, by when the
 //     window lifts. A nearly spent window must not win just because its reset is soonest.
@@ -50,8 +53,8 @@ const (
 type soonestResetTier int
 
 const (
-	soonestResetUnknown soonestResetTier = iota
-	soonestResetKnown
+	soonestResetKnown soonestResetTier = iota
+	soonestResetUnknown
 	soonestResetRejected
 )
 
@@ -74,19 +77,20 @@ func (s *SoonestResetSelector) Pick(ctx context.Context, provider, model string,
 	key := provider + ":" + canonicalModelKey(model)
 	if !slices.ContainsFunc(available, func(auth *Auth) bool { return !isClaudeAuth(auth) }) {
 		ranks := make([]soonestResetRank, 0, len(available))
-		var unknown []*Auth
 		for _, auth := range available {
-			rank := rankBySoonestReset(auth, now)
+			ranks = append(ranks, rankBySoonestReset(auth, now))
+		}
+		best := slices.MinFunc(ranks, compareSoonestResetRank)
+		if best.tier != soonestResetUnknown {
+			return best.auth, nil
+		}
+		// Unobserved credentials share a tier; rotate so none is favored.
+		available = available[:0:0]
+		for _, rank := range ranks {
 			if rank.tier == soonestResetUnknown {
-				unknown = append(unknown, auth)
-				continue
+				available = append(available, rank.auth)
 			}
-			ranks = append(ranks, rank)
 		}
-		if len(unknown) == 0 {
-			return slices.MinFunc(ranks, compareSoonestResetRank).auth, nil
-		}
-		available = unknown
 	}
 	return s.rotation.next(key, available), nil
 }
@@ -97,7 +101,7 @@ func isClaudeAuth(auth *Auth) bool {
 
 func rankBySoonestReset(auth *Auth, now time.Time) soonestResetRank {
 	signals := auth.Quota.Signals
-	rank := soonestResetRank{auth: auth, util5h: math.Inf(1)}
+	rank := soonestResetRank{auth: auth, tier: soonestResetUnknown, util5h: math.Inf(1)}
 	if util, errParse := strconv.ParseFloat(strings.TrimSpace(signals[claudeUnified5hUtilizationSignal]), 64); errParse == nil && !math.IsNaN(util) {
 		rank.util5h = util
 	}

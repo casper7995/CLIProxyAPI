@@ -85,26 +85,34 @@ func TestSoonestResetSelectorPick_Order(t *testing.T) {
 			want: "b",
 		},
 		{
-			name: "account without signals is probed first",
+			name: "observed account with headroom beats an unobserved one",
 			auths: []*Auth{
-				claudeAuth("a", &claudeWindow{reset7d: now.Add(time.Hour)}),
+				claudeAuth("a", &claudeWindow{reset7d: now.Add(6 * day)}),
 				claudeAuth("z", nil),
 			},
-			want: "z",
+			want: "a",
 		},
 		{
 			name: "unparseable reset counts as unknown",
 			auths: []*Auth{
-				claudeAuth("a", &claudeWindow{reset7d: now.Add(time.Hour)}),
+				claudeAuth("a", &claudeWindow{reset7d: now.Add(6 * day)}),
 				claudeAuth("z", &claudeWindow{raw7d: "soon"}),
 			},
-			want: "z",
+			want: "a",
 		},
 		{
 			name: "past 7d reset counts as unknown",
 			auths: []*Auth{
-				claudeAuth("a", &claudeWindow{reset7d: now.Add(time.Hour)}),
+				claudeAuth("a", &claudeWindow{reset7d: now.Add(6 * day)}),
 				claudeAuth("z", &claudeWindow{reset7d: now.Add(-time.Hour)}),
+			},
+			want: "a",
+		},
+		{
+			name: "unobserved account beats a rejected one",
+			auths: []*Auth{
+				claudeAuth("a", &claudeWindow{reset7d: now.Add(time.Hour), status7d: "rejected"}),
+				claudeAuth("z", nil),
 			},
 			want: "z",
 		},
@@ -195,8 +203,9 @@ func TestSoonestResetSelectorPick_UnknownAccountsRoundRobin(t *testing.T) {
 	t.Parallel()
 
 	now := time.Now()
+	// Unobserved accounts rotate among themselves once no observed account has headroom.
 	auths := []*Auth{
-		claudeAuth("known", &claudeWindow{reset7d: now.Add(time.Hour)}),
+		claudeAuth("spent", &claudeWindow{reset7d: now.Add(time.Hour), status7d: "rejected"}),
 		claudeAuth("u2", nil),
 		claudeAuth("u1", &claudeWindow{reset7d: now.Add(-time.Hour)}),
 	}
@@ -264,7 +273,7 @@ func TestSoonestResetSelectorPick_Concurrent(t *testing.T) {
 	now := time.Now()
 	selector := &SoonestResetSelector{}
 	auths := []*Auth{
-		claudeAuth("known", &claudeWindow{reset7d: now.Add(time.Hour)}),
+		claudeAuth("spent", &claudeWindow{reset7d: now.Add(time.Hour), status7d: "rejected"}),
 		claudeAuth("u1", nil),
 		claudeAuth("u2", nil),
 	}
@@ -301,8 +310,8 @@ func TestSoonestResetSelectorPick_Concurrent(t *testing.T) {
 		t.Fatalf("concurrent Pick() failed: %v", err)
 	default:
 	}
-	if counts["known"] != 0 || counts["u1"] != 1600 || counts["u2"] != 1600 {
-		t.Fatalf("counts = %v, want u1=1600 u2=1600 known=0", counts)
+	if counts["spent"] != 0 || counts["u1"] != 1600 || counts["u2"] != 1600 {
+		t.Fatalf("counts = %v, want u1=1600 u2=1600 spent=0", counts)
 	}
 }
 

@@ -3,6 +3,7 @@ package auth
 import (
 	"context"
 	"net/http"
+	"strconv"
 	"sync"
 	"testing"
 	"time"
@@ -315,5 +316,50 @@ func TestCooldownReprobeInterval(t *testing.T) {
 	}
 	if got := CooldownReprobeInterval(nil); got != DefaultCooldownReprobeInterval {
 		t.Errorf("CooldownReprobeInterval(nil) = %v, want default", got)
+	}
+}
+
+func TestCooldownReprobe_ObservesUnobservedAccountsOnly(t *testing.T) {
+	m, executor := newReprobeTestManager(t, "45m")
+	unobserved := newReprobeTestAuth("unobserved")
+	registerReprobeTestAuth(t, m, unobserved)
+	observed := newReprobeTestAuth("observed")
+	registerReprobeTestAuth(t, m, observed)
+	m.mu.Lock()
+	m.auths[observed.ID].Quota.Signals = map[string]string{
+		"Anthropic-Ratelimit-Unified-7d-Reset": strconv.FormatInt(time.Now().Add(48*time.Hour).Unix(), 10),
+	}
+	m.auths[observed.ID].Quota.ObservedAt = time.Now()
+	m.mu.Unlock()
+
+	executor.headers = http.Header{
+		"Anthropic-Ratelimit-Unified-7d-Status":      {"allowed"},
+		"Anthropic-Ratelimit-Unified-7d-Utilization": {"0.30"},
+		"Anthropic-Ratelimit-Unified-7d-Reset":       {strconv.FormatInt(time.Now().Add(72*time.Hour).Unix(), 10)},
+	}
+	// The startup pass (includeCooled=false) still observes unknown accounts.
+	if probed := m.cooldownReprobeSweep(context.Background(), noReprobeWait, false); probed != 1 {
+		t.Fatalf("probed = %d, want 1", probed)
+	}
+	calls := executor.recorded()
+	if len(calls) != 1 || calls[0].authID != unobserved.ID || calls[0].model != reprobeTestHaiku {
+		t.Fatalf("calls = %+v, want one Haiku probe of the unobserved account", calls)
+	}
+	if got := mustAuth(t, m, unobserved.ID).Quota.Signals["Anthropic-Ratelimit-Unified-7d-Utilization"]; got != "0.30" {
+		t.Fatalf("observation not recorded: %q", got)
+	}
+	// Now observed, it is not probed again.
+	if probed := m.cooldownReprobeSweep(context.Background(), noReprobeWait, false); probed != 0 {
+		t.Fatalf("second sweep probed %d, want 0", probed)
+	}
+}
+
+func TestCooldownReprobe_StartupPassSkipsLongCooldowns(t *testing.T) {
+	m, executor := newReprobeTestManager(t, "45m")
+	auth := newReprobeTestAuth("cooling")
+	registerReprobeTestAuth(t, m, auth)
+	benchForWeeklyQuota(m, auth.ID)
+	if probed := m.cooldownReprobeSweep(context.Background(), noReprobeWait, false); probed != 0 || len(executor.recorded()) != 0 {
+		t.Fatalf("startup pass probed a cooling account (probed=%d)", probed)
 	}
 }
