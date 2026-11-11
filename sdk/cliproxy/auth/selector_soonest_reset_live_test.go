@@ -156,20 +156,30 @@ func liveProcess(t *testing.T, snapshotPath string, upstream *liveUpstream) *Man
 	m.SetSelector(affinity)
 	m.RegisterExecutor(upstream)
 	m.SetConfig(nil)
-	reg := registry.GetGlobalRegistry()
-	for _, id := range liveAccounts {
-		reg.RegisterClient(id, "claude", []*registry.ModelInfo{{ID: liveModel}, {ID: reprobeTestHaiku}})
+	newAuth := func(id string) *Auth {
 		auth := &Auth{ID: id, FileName: id, Provider: "claude", Status: StatusActive, Attributes: map[string]string{"api_key": "fixture-key"}}
 		if id == liveThinkgym {
 			auth.Attributes["priority"] = "-1"
 		}
-		if _, errRegister := m.Register(WithSkipPersist(context.Background()), auth); errRegister != nil {
+		return auth
+	}
+	reg := registry.GetGlobalRegistry()
+	for _, id := range liveAccounts {
+		reg.RegisterClient(id, "claude", []*registry.ModelInfo{{ID: liveModel}, {ID: reprobeTestHaiku}})
+		if _, errRegister := m.Register(WithSkipPersist(context.Background()), newAuth(id)); errRegister != nil {
 			t.Fatalf("register %s: %v", id, errRegister)
 		}
 	}
 	m.SetQuotaSignalStore(NewFileQuotaSignalStore(snapshotPath))
 	if errRestore := m.RestoreQuotaSignals(context.Background()); errRestore != nil {
 		t.Fatalf("restore quota signals: %v", errRestore)
+	}
+	// Startup re-synthesizes credentials and pushes them through Update again;
+	// the restored observations and cooldowns must survive that.
+	for _, id := range liveAccounts {
+		if _, errUpdate := m.Update(WithSkipPersist(context.Background()), newAuth(id)); errUpdate != nil {
+			t.Fatalf("re-register %s: %v", id, errUpdate)
+		}
 	}
 	return m
 }

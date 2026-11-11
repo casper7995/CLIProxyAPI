@@ -199,3 +199,32 @@ func TestQuotaSignals_RestoredSignalsRankFirstSelection(t *testing.T) {
 		}
 	}
 }
+
+// Config-defined credentials are re-synthesized and pushed through Update after
+// startup. The incoming auth carries no observation; the restored one must survive
+// even when the credential is not cooling (only cooling ones used to keep it).
+func TestQuotaSignals_UpdateKeepsObservationOfHealthyCredential(t *testing.T) {
+	path := filepath.Join(t.TempDir(), QuotaSignalFileName)
+	id := uuid.NewString() + "-config-key"
+	reset := unixSignal(time.Now().Add(3 * 24 * time.Hour))
+	if errSave := NewFileQuotaSignalStore(path).Save(context.Background(), map[string]QuotaSignalSnapshot{
+		id: {Provider: "claude", ObservedAt: time.Now().Add(-time.Minute), Signals: map[string]string{
+			"Anthropic-Ratelimit-Unified-7d-Status":      "allowed",
+			"Anthropic-Ratelimit-Unified-7d-Utilization": "0.04",
+			"Anthropic-Ratelimit-Unified-7d-Reset":       reset,
+		}},
+	}); errSave != nil {
+		t.Fatalf("seed snapshot: %v", errSave)
+	}
+	m := quotaSignalTestManager(t, path, id)
+	if errRestore := m.RestoreQuotaSignals(context.Background()); errRestore != nil {
+		t.Fatalf("restore: %v", errRestore)
+	}
+	fresh := &Auth{ID: id, Provider: "claude", Attributes: map[string]string{"api_key": "test-key"}}
+	if _, errUpdate := m.Update(WithSkipPersist(context.Background()), fresh); errUpdate != nil {
+		t.Fatalf("update: %v", errUpdate)
+	}
+	if got := mustAuth(t, m, id).Quota.Signals["Anthropic-Ratelimit-Unified-7d-Reset"]; got != reset {
+		t.Fatalf("restored observation lost on re-registration: signals=%v", mustAuth(t, m, id).Quota.Signals)
+	}
+}
