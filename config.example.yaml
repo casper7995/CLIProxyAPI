@@ -176,6 +176,10 @@ routing:
   session-affinity: false # default: false
   # How long session-to-auth bindings are retained. Default: 1h
   session-affinity-ttl: "1h"
+  # Re-check Claude credentials benched by a quota cooldown with more than 30 minutes left,
+  # sending one 1-token Haiku request per credential per interval. An allowed answer clears
+  # the cooldown; a renewed 429 keeps it with the fresh reset time. Default: 45m. "0" disables.
+  # cooldown-reprobe-interval: "45m"
   # When true (default), subagents (child sessions with parent references) inherit and bind
   # to the parent's upstream credential across all providers (Claude, Codex, Antigravity, Gemini),
   # for the same model, maximizing Prompt/KV Cache reuse and minimizing TTFT.
