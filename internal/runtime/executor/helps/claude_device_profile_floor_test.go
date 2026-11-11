@@ -130,3 +130,24 @@ func TestClaudeDeviceFloor_CachedProfileUpgradesOnNewerVersion(t *testing.T) {
 		t.Fatalf("cache TTL remaining = %v, want refreshed to ~%v", remaining, claudeDeviceProfileTTL)
 	}
 }
+
+// Agent SDK hosts name their own entrypoint (T3 Code sends "t3-code") but run
+// the real Claude Code binary. On 11 Nov 2026 such requests were treated as
+// foreign, cloaked to 2.1.280, and rejected by Anthropic for claude-opus-5-5.
+func TestClaudeDeviceFloor_AgentSDKHostEntrypointIsGenuineClaudeCode(t *testing.T) {
+	headers := http.Header{
+		"User-Agent":     {"claude-cli/2.1.322 (external, t3-code, agent-sdk/0.3.321)"},
+		"X-App":          {"cli"},
+		"Anthropic-Beta": {"claude-code-20250219,interleaved-thinking-2025-05-14"},
+	}
+	payload := claudeCodeDetectionPayload(validClaudeCodeMetadataUserID)
+	if detection := DetectClaudeCodeRequest(headers, payload, false); !detection.Confirmed {
+		t.Fatalf("t3-code agent-sdk detection = %#v, want confirmed", detection)
+	}
+
+	// An unknown entrypoint without the agent-sdk suffix stays foreign.
+	headers.Set("User-Agent", "claude-cli/2.1.322 (external, some-proxy)")
+	if detection := DetectClaudeCodeRequest(headers, payload, false); detection.Confirmed {
+		t.Fatalf("unknown entrypoint detection = %#v, want not confirmed", detection)
+	}
+}
