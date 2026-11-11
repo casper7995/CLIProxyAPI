@@ -339,3 +339,66 @@ func TestManagerSoonestResetSelectorReadsRegisteredQuotaSignals(t *testing.T) {
 		})
 	}
 }
+
+func claudeSignalsAuth(id string, signals map[string]string) *Auth {
+	return &Auth{ID: id, Provider: "claude", Quota: QuotaState{Signals: signals, ObservedAt: time.Now()}}
+}
+
+func TestSoonestResetSelectorPick_NearLimitAccountsRankLast(t *testing.T) {
+	now := time.Now()
+	reset := func(d time.Duration) string { return strconv.FormatInt(now.Add(d).Unix(), 10) }
+	spent7d := claudeSignalsAuth("a-spent-7d", map[string]string{
+		"Anthropic-Ratelimit-Unified-7d-Status":      "allowed_warning",
+		"Anthropic-Ratelimit-Unified-7d-Utilization": "0.99",
+		"Anthropic-Ratelimit-Unified-7d-Reset":       reset(24 * time.Hour),
+	})
+	rejected7d := claudeSignalsAuth("b-rejected-7d", map[string]string{
+		"Anthropic-Ratelimit-Unified-7d-Status": "rejected",
+		"Anthropic-Ratelimit-Unified-7d-Reset":  reset(12 * time.Hour),
+	})
+	spent5h := claudeSignalsAuth("c-spent-5h", map[string]string{
+		"Anthropic-Ratelimit-Unified-5h-Utilization": "0.985",
+		"Anthropic-Ratelimit-Unified-5h-Reset":       reset(time.Hour),
+		"Anthropic-Ratelimit-Unified-7d-Utilization": "0.20",
+		"Anthropic-Ratelimit-Unified-7d-Reset":       reset(6 * time.Hour),
+	})
+	headroomSoon := claudeSignalsAuth("d-headroom-soon", map[string]string{
+		"Anthropic-Ratelimit-Unified-7d-Status":      "allowed",
+		"Anthropic-Ratelimit-Unified-7d-Utilization": "0.50",
+		"Anthropic-Ratelimit-Unified-7d-Reset":       reset(3 * 24 * time.Hour),
+	})
+	headroomLate := claudeSignalsAuth("e-headroom-late", map[string]string{
+		"Anthropic-Ratelimit-Unified-7d-Status":      "allowed",
+		"Anthropic-Ratelimit-Unified-7d-Utilization": "0.20",
+		"Anthropic-Ratelimit-Unified-7d-Reset":       reset(5 * 24 * time.Hour),
+	})
+
+	selector := &SoonestResetSelector{}
+	all := []*Auth{spent7d, rejected7d, spent5h, headroomSoon, headroomLate}
+	if got := pickIDs(t, selector, "claude", all, 3); got[0] != headroomSoon.ID || got[1] != headroomSoon.ID || got[2] != headroomSoon.ID {
+		t.Fatalf("picks = %v, want the soonest-reset account with headroom %s", got, headroomSoon.ID)
+	}
+	if got := pickIDs(t, selector, "claude", []*Auth{spent7d, headroomLate}, 1); got[0] != headroomLate.ID {
+		t.Fatalf("pick = %v, want headroom account over 0.99-utilized one", got)
+	}
+	// With only spent accounts left, the one whose window lifts first wins.
+	if got := pickIDs(t, selector, "claude", []*Auth{spent7d, rejected7d, spent5h}, 1); got[0] != spent5h.ID {
+		t.Fatalf("pick = %v, want the spent account that lifts first %s", got, spent5h.ID)
+	}
+}
+
+func TestSoonestResetSelectorPick_NearLimitWindowAlreadyReset(t *testing.T) {
+	now := time.Now()
+	// The 0.99 reading belongs to a window that already rolled over, so it no longer applies.
+	rolled := claudeSignalsAuth("a-rolled", map[string]string{
+		"Anthropic-Ratelimit-Unified-7d-Utilization": "0.99",
+		"Anthropic-Ratelimit-Unified-7d-Reset":       strconv.FormatInt(now.Add(-time.Hour).Unix(), 10),
+	})
+	spent := claudeSignalsAuth("b-spent", map[string]string{
+		"Anthropic-Ratelimit-Unified-7d-Utilization": "0.99",
+		"Anthropic-Ratelimit-Unified-7d-Reset":       strconv.FormatInt(now.Add(time.Hour).Unix(), 10),
+	})
+	if got := pickIDs(t, &SoonestResetSelector{}, "claude", []*Auth{spent, rolled}, 1); got[0] != rolled.ID {
+		t.Fatalf("pick = %v, want the rolled-over account %s", got, rolled.ID)
+	}
+}

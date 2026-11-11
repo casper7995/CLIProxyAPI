@@ -94,6 +94,13 @@ func (s *Service) Run(ctx context.Context) error {
 				log.Warnf("failed to restore cooldown state: %v", errRestoreCooldown)
 			}
 		}
+		// Restore quota observations before the server starts so the selector can
+		// rank credentials and exhausted windows stay benched across restarts.
+		s.coreManager.SetQuotaSignalStore(s.resolveQuotaSignalStore(cfg))
+		if errRestoreSignals := s.coreManager.RestoreQuotaSignals(ctx); errRestoreSignals != nil {
+			log.Warnf("failed to restore quota signals: %v", errRestoreSignals)
+		}
+		s.coreManager.StartQuotaSignalPersistence(ctx, quotaSignalPersistInterval)
 		s.registerAvailableExecutors(ctx, executorRegistrationOptions{
 			includeBaseline: true,
 			auths:           s.coreManager.List(),
@@ -328,6 +335,7 @@ func (s *Service) Shutdown(ctx context.Context) error {
 		if s.coreManager != nil {
 			s.coreManager.StopAutoRefresh()
 			s.coreManager.StopCooldownReprobe()
+			s.coreManager.StopQuotaSignalPersistence()
 		}
 		if watcher := s.currentWatcher(); watcher != nil {
 			if err := watcher.Stop(); err != nil {
