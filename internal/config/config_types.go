@@ -457,7 +457,7 @@ type QuotaExceeded struct {
 // RoutingConfig configures how credentials are selected for requests.
 type RoutingConfig struct {
 	// Strategy selects the credential selection strategy.
-	// Supported values: "round-robin" (default), "weighted-round-robin", "fill-first".
+	// Supported values: "round-robin" (default), "weighted-round-robin", "fill-first", "soonest-reset".
 	Strategy string `yaml:"strategy,omitempty" json:"strategy,omitempty"`
 
 	// SessionAffinity enables universal session-sticky routing for all clients.
@@ -487,6 +487,12 @@ type RoutingConfig struct {
 	//     auth errors (429, 401/402/403, 404/model support, invalid_grant) rebind as normal.
 	// Ignored when SessionAffinity is false.
 	SessionAffinityRebindOn string `yaml:"session-affinity-rebind-on,omitempty" json:"session-affinity-rebind-on,omitempty"`
+
+	// CooldownReprobeInterval controls how often credentials benched by a long quota cooldown
+	// (more than 30 minutes remaining) are re-checked with one minimal upstream request, so an
+	// early upstream reset is noticed before the advertised retry time.
+	// Default: 45m when unset. "0" disables re-probing. Accepts duration strings like "30m", "1h".
+	CooldownReprobeInterval string `yaml:"cooldown-reprobe-interval,omitempty" json:"cooldown-reprobe-interval,omitempty"`
 }
 
 // OAuthModelAlias defines a model ID alias for a specific channel.

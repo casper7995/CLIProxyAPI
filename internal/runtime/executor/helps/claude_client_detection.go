@@ -70,6 +70,23 @@ var nativeClaudeEntrypoints = map[string]bool{
 	"claude-vscode": true,
 }
 
+// isNativeClaudeCodeEntrypoint reports whether a Claude Code UA comes from the
+// real CLI wire profile. Entrypoints with a measured classification keep it
+// (sdk-py, desktop and remote stay non-native). An unclassified entrypoint with an
+// agent-sdk/x.y.z suffix is an Agent SDK host naming itself (T3 Code sends
+// "t3-code") around the real CLI binary, so it is native. Without this such hosts
+// were cloaked down to the baseline version, which Anthropic rejects for models
+// that need a newer Claude Code.
+func isNativeClaudeCodeEntrypoint(entrypoint, agentSDKVersion string) bool {
+	if nativeClaudeEntrypoints[entrypoint] {
+		return true
+	}
+	if _, classified := claudeCodeSubclientByEntrypoint[entrypoint]; classified {
+		return false
+	}
+	return entrypoint != "" && agentSDKVersion != ""
+}
+
 type claudeCodeHelperShape uint8
 
 const (
@@ -155,7 +172,7 @@ func DetectClaudeCodeRequest(headers http.Header, payload []byte, countTokens bo
 
 	metadataUserID := gjson.GetBytes(payload, "metadata.user_id")
 	detection.MetadataUserID = metadataUserID.Exists() && metadataUserID.Type == gjson.String && isValidUserID(metadataUserID.String())
-	detection.NativeClient = nativeClaudeEntrypoints[entrypoint]
+	detection.NativeClient = isNativeClaudeCodeEntrypoint(entrypoint, agentSDKVersion)
 	standardSignals := detection.XAppCLI && detection.UserAgent && detection.BetasPresent && (countTokens || detection.MetadataUserID)
 	detection.HelperProfile = detection.NativeClient && matchesMeasuredClaudeCodeHelperProfile(headers, payload, countTokens, detection, cfg)
 	detection.StrongSignals = standardSignals || detection.HelperProfile

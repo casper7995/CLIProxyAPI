@@ -3,6 +3,7 @@ package cliproxy
 import (
 	"context"
 	"os"
+	"path/filepath"
 	"runtime"
 	"strings"
 	"time"
@@ -706,6 +707,26 @@ func (s *Service) resolveCooldownStateStore(cfg *config.Config) coreauth.Cooldow
 		return nil
 	}
 	return coreauth.NewFileCooldownStateStoreWithAuthDir(authDir, authDir)
+}
+
+// quotaSignalPersistInterval is how often changed quota observations are saved.
+const quotaSignalPersistInterval = time.Minute
+
+// resolveQuotaSignalStore returns the quota observation snapshot store kept in
+// the auth directory. Home mode owns credential state remotely and has none.
+func (s *Service) resolveQuotaSignalStore(cfg *config.Config) coreauth.QuotaSignalStore {
+	if cfg == nil || cfg.Home.Enabled {
+		return nil
+	}
+	authDir, errResolve := resolveCooldownStateAuthDir(cfg)
+	if errResolve != nil {
+		log.Warnf("failed to resolve quota signal directory: %v", errResolve)
+		return nil
+	}
+	if authDir == "" {
+		return nil
+	}
+	return coreauth.NewFileQuotaSignalStore(filepath.Join(authDir, coreauth.QuotaSignalFileName))
 }
 
 func resolveCooldownStateAuthDir(cfg *config.Config) (string, error) {
