@@ -318,6 +318,7 @@ func (m *Manager) updateInternalLocked(ctx context.Context, base, auth *Auth, mo
 		m.mu.Unlock()
 		return nil, false, false, nil
 	}
+	previouslyDisabled := authDisabledForAffinity(existing)
 	if m.authEpochs == nil {
 		m.authEpochs = make(map[string]uint64)
 	}
@@ -593,6 +594,11 @@ func (m *Manager) updateInternalLocked(ctx context.Context, base, auth *Auth, mo
 	}
 	m.mu.Unlock()
 	_ = schedulerSnapshot
+	// Only a transition into disabled/unavailable-via-status clears affinity.
+	// Token refreshes and quota-signal writes stay bound.
+	if !previouslyDisabled && authDisabledForAffinity(auth) {
+		m.invalidateSessionAffinity(auth.ID)
+	}
 	return auth.Clone(), true, cooldownStateChanged, nil
 }
 
@@ -674,6 +680,10 @@ func (m *Manager) Remove(ctx context.Context, id string) {
 	m.persistCooldownStates(context.Background())
 }
 
+func authDisabledForAffinity(auth *Auth) bool {
+	return auth != nil && (auth.Disabled || auth.Status == StatusDisabled)
+}
+
 func (m *Manager) invalidateSessionAffinity(authID string) {
 	if m == nil || authID == "" {
 		return
@@ -681,6 +691,7 @@ func (m *Manager) invalidateSessionAffinity(authID string) {
 	sel := m.Selector()
 	if invalidator, ok := sel.(interface{ InvalidateAuth(string) }); ok && invalidator != nil {
 		invalidator.InvalidateAuth(authID)
+		log.Infof("session-affinity: invalidated bindings for auth=%s", authID)
 	}
 }
 
